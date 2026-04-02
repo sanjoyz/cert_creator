@@ -1,0 +1,4 @@
+# One certificate code per line. Lines starting with # and empty lines are ignored.
+CODE-001
+CODE-002
+CODE-003

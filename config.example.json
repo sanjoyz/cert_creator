@@ -1,0 +1,19 @@
+{
+  "$schema": "local",
+  "api_url": "https://gramotadel.express/api/v1/tilda-create/",
+  "output_dir": "out",
+  "request_delay_ms": 300,
+  "mask_sum": "1",
+  "mask_date": "10,05.2026",
+  "mask_city": "RF",
+  "mask_adress": "asd",
+  "mask_phone": "123",
+  "mask_valuta": "euro",
+  "secure": "00000000-0000-0000-0000-000000000000",
+  "doc_id": "00000000-0000-0000-0000-000000000000",
+  "form_id": "23tzcmwldz2",
+  "form_spec_comments": "Its good",
+  "origin": "https://pixelquest.ru",
+  "referer": "https://pixelquest.ru/",
+  "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+}

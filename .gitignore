@@ -1,0 +1,7 @@
+# Local secrets — copy from config.example.json and fill in
+config.json
+config.local.json
+codes.txt
+
+# Generated certificates
+out/
