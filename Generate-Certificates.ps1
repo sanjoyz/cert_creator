@@ -3,27 +3,193 @@
 .SYNOPSIS
   Batch-download PDF certificates from gramotadel API (one request per mask_code).
 
-  Smoke test:
-  1. Copy config.example.json to config.json and set secure, doc_id (from browser DevTools on successful POST to tilda-create).
-  2. Create codes.txt with one line (one code) or use -CodesPath codes.example.txt after editing.
-  3. Run: .\Generate-Certificates.ps1
-  4. Open PDFs under the output folder (default .\out).
+  Modes:
+  - Default: read config.json + codes.txt, POST tilda-create for each code.
+  - -Interactive: ask how many codes to generate, optional prompts for sum/date, generate random codes.
+  - Tokens: if secure/doc_id are placeholders (all zeros) or -FetchTokens, unlock Tilda password page
+    via auth.tildacdn.com (two-step POST /api/accesspage) and parse hidden fields from HTML.
 
-  If the API returns JSON with a download URL instead of raw PDF, the script tries to fetch common property names (url, pdf_url, file, link).
-  If the API returns HTML with data-url (gramotadel gd-success widget), the script opens the embed URL, POSTs the status form, then GETs https://embed.gramotadel.express/getfile/{creater_id}/pdf/ with Referer set to the widget page (same as the browser).
+  Tilda password: set environment variable CERT_TILDA_PASSWORD, or enter when prompted (interactive / fetch).
+
+  Smoke test (manual tokens):
+  1. Copy config.example.json to config.json and set secure, doc_id (or use -FetchTokens).
+  2. Create codes.txt with one code per line.
+  3. Run: .\Generate-Certificates.ps1
+  4. Open PDFs under .\out (default).
+
+  If the API returns HTML with data-url (gramotadel embed), the script polls status, POSTs widget form, GETs PDF.
 #>
 [CmdletBinding()]
 param(
     [string] $ConfigPath = "config.json",
-    [string] $CodesPath = "codes.txt"
+    [string] $CodesPath = "codes.txt",
+    [switch] $Interactive,
+    [switch] $FetchTokens
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+$TildaAuthJsUrl = "https://auth.tildacdn.com/js/tilda-auth.js"
+$TildaAccessPageUrl = "https://auth.tildacdn.com/api/accesspage"
+
 function Escape-FormPart([string] $s) {
     if ($null -eq $s) { return "" }
     return [uri]::EscapeDataString([string] $s)
+}
+
+function Test-IsPlaceholderGuid([string] $s) {
+    if ([string]::IsNullOrWhiteSpace($s)) { return $true }
+    return ($s -match '^(?i)0{8}-0{4}-0{4}-0{4}-0{12}$')
+}
+
+function Get-ConfigString {
+    param(
+        [object] $Object,
+        [string] $Name,
+        [string] $Default = ""
+    )
+    $prop = $Object.PSObject.Properties[$Name]
+    if ($null -eq $prop) { return $Default }
+    $v = $prop.Value
+    if ($null -eq $v) { return $Default }
+    return [string]$v
+}
+
+function ConvertFrom-SecureStringPlain {
+    param([System.Security.SecureString] $SecureString)
+    if ($null -eq $SecureString) { return $null }
+    $b = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureString)
+    try {
+        return [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($b)
+    }
+    finally {
+        [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b)
+    }
+}
+
+function Get-TildaAuthTemplateFromJs {
+    <#
+      Tilda password page loads tilda-auth.js. It contains:
+      - sessionStorage default: sessionStorage.setItem('TildaPageAuth','...')
+      - template csrf inside drawPasswordForm: name="csrf" value="..."
+      First POST to /api/accesspage (empty password) returns csrf_val for the real login POST.
+    #>
+    param(
+        [string] $UserAgent
+    )
+    $h = @{ Accept = "text/javascript,*/*;q=0.8" }
+    if ($UserAgent) { $h["User-Agent"] = $UserAgent }
+    $r = Invoke-WebRequest -UseBasicParsing -Uri $TildaAuthJsUrl -Headers $h -MaximumRedirection 5
+    $js = $r.Content
+    $sessionInit = $null
+    $csrfTemplate = $null
+    if ($js -match "sessionStorage\.setItem\('TildaPageAuth','([^']+)'\)") {
+        $sessionInit = $Matches[1]
+    }
+    if ($js -match 'name="csrf"\s+value="([^"]+)"') {
+        $csrfTemplate = $Matches[1]
+    }
+    if (-not $sessionInit -or -not $csrfTemplate) {
+        throw "Could not parse session/csrf template from tilda-auth.js (Tilda may have changed the script)."
+    }
+    return @{
+        SessionInit  = $sessionInit
+        CsrfTemplate = $csrfTemplate
+    }
+}
+
+function Invoke-TildaAccessPageUnlock {
+    param(
+        [string] $Password,
+        [string] $ProjectId,
+        [string] $PageId,
+        [string] $RefererPageUrl,
+        [string] $Origin,
+        [string] $UserAgent
+    )
+    $tpl = Get-TildaAuthTemplateFromJs -UserAgent $UserAgent
+    $sessionInit = $tpl.SessionInit
+    $csrfTemplate = $tpl.CsrfTemplate
+
+    $h = @{
+        "Origin"  = $Origin
+        "Referer" = $RefererPageUrl
+        "Accept"  = "application/json, text/javascript, */*; q=0.01"
+        "Content-Type" = "application/x-www-form-urlencoded; charset=UTF-8"
+    }
+    if ($UserAgent) { $h["User-Agent"] = $UserAgent }
+
+    $body1 = "password=&projectid=$(Escape-FormPart $ProjectId)&pageid=$(Escape-FormPart $PageId)&csrf=$(Escape-FormPart $csrfTemplate)&session=$(Escape-FormPart $sessionInit)"
+    $r1 = Invoke-WebRequest -UseBasicParsing -Uri $TildaAccessPageUrl -Method POST -Headers $h -Body $body1 -MaximumRedirection 5
+    $j1 = $r1.Content | ConvertFrom-Json
+    if (-not $j1.csrf_val) {
+        throw "Tilda accesspage step 1: no csrf_val in response."
+    }
+    $csrfVal = [string]$j1.csrf_val
+
+    $body2 = "password=$(Escape-FormPart $Password)&projectid=$(Escape-FormPart $ProjectId)&pageid=$(Escape-FormPart $PageId)&csrf=$(Escape-FormPart $csrfVal)&session=$(Escape-FormPart $sessionInit)"
+    $r2 = Invoke-WebRequest -UseBasicParsing -Uri $TildaAccessPageUrl -Method POST -Headers $h -Body $body2 -MaximumRedirection 5
+    $j2 = $r2.Content | ConvertFrom-Json
+    if ($j2.status -ne "success") {
+        $msg = if ($j2.message) { [string]$j2.message } else { $r2.Content }
+        throw "Tilda accesspage login failed: $msg"
+    }
+    $html = [string]$j2.content
+    if ([string]::IsNullOrWhiteSpace($html)) {
+        throw "Tilda accesspage: empty content after successful login."
+    }
+    return $html
+}
+
+function Get-SecureDocIdFromPageHtml {
+    param(
+        [string] $Html,
+        [string] $CertificateFormId
+    )
+    $formId = if ($CertificateFormId) { $CertificateFormId } else { "form777631482" }
+    $pattern = '(?is)<form[^>]*\bid="' + [regex]::Escape($formId) + '"[^>]*>(.*?)</form>'
+    if ($Html -notmatch $pattern) {
+        throw "Could not find form id=`"$formId`" in unlocked page HTML. Set certificate_form_id in config to match your Tilda form id."
+    }
+    $formHtml = $Matches[1]
+    $secure = $null
+    $docId = $null
+    if ($formHtml -match '(?is)name="secure"[^>]*value="([^"]*)"') {
+        $secure = $Matches[1]
+    }
+    if ($formHtml -match '(?is)name="doc_id"[^>]*value="([^"]*)"') {
+        $docId = $Matches[1]
+    }
+    if (-not $secure -or -not $docId) {
+        throw "Could not parse hidden secure/doc_id inside form $formId."
+    }
+    return @{
+        Secure = $secure
+        DocId  = $docId
+    }
+}
+
+function New-RandomCertificateCodes {
+    param([int] $Count, [int] $Length = 6)
+    $chars = [char[]]((65..90) + (48..57))
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    $buf = New-Object byte[] $Length
+    $list = [System.Collections.Generic.List[string]]::new()
+    $seen = @{}
+    while ($list.Count -lt $Count) {
+        $rng.GetBytes($buf)
+        $sb = [System.Text.StringBuilder]::new()
+        for ($i = 0; $i -lt $Length; $i++) {
+            [void]$sb.Append($chars[$buf[$i] % $chars.Length])
+        }
+        $code = $sb.ToString()
+        if (-not $seen.ContainsKey($code)) {
+            $seen[$code] = $true
+            $list.Add($code)
+        }
+    }
+    return ,$list.ToArray()
 }
 
 function Sanitize-FileName([string] $name) {
@@ -246,7 +412,6 @@ function Save-ResponseAsPdf {
     }
     $textBody = $Response.Content
     if ($textBody -and $textBody -match '(?i)data-url\s*=\s*"(https://[^"]+)"') {
-        # API may wrap the HTML; line breaks inside the quoted URL must be removed for a valid URI.
         $widgetUrl = ($Matches[1] -replace '\s+', '').Trim()
         if (Save-PdfViaGramotadelEmbed -WidgetUrl $widgetUrl -Session $Session -BaseHeaders $BaseHeaders -OutPath $OutPath) {
             return $true
@@ -259,54 +424,126 @@ if (-not (Test-Path -LiteralPath $ConfigPath)) {
     throw "Config not found: $ConfigPath (copy config.example.json to config.json)."
 }
 
-if (-not (Test-Path -LiteralPath $CodesPath)) {
-    throw "Codes file not found: $CodesPath"
+if (-not $Interactive -and -not (Test-Path -LiteralPath $CodesPath)) {
+    throw "Codes file not found: $CodesPath (use -Interactive or create codes.txt)."
 }
 
 $configRaw = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8
 $config = $configRaw | ConvertFrom-Json
 
-$apiUrl = if ($config.api_url) { $config.api_url } else { "https://gramotadel.express/api/v1/tilda-create/" }
-$outputDir = if ($config.output_dir) { $config.output_dir } else { "out" }
-$delayMs = if ($null -ne $config.request_delay_ms) { [int]$config.request_delay_ms } else { 300 }
+$apiUrl = Get-ConfigString $config "api_url" ""
+if ([string]::IsNullOrWhiteSpace($apiUrl)) { $apiUrl = "https://gramotadel.express/api/v1/tilda-create/" }
+$outputDir = Get-ConfigString $config "output_dir" ""
+if ([string]::IsNullOrWhiteSpace($outputDir)) { $outputDir = "out" }
+$delayProp = $config.PSObject.Properties["request_delay_ms"]
+$delayMs = 300
+if ($null -ne $delayProp -and $null -ne $delayProp.Value) {
+    $delayMs = [int]$delayProp.Value
+}
+
+$tildaPageUrl = Get-ConfigString $config "tilda_page_url" ""
+if ([string]::IsNullOrWhiteSpace($tildaPageUrl)) { $tildaPageUrl = "https://pixelquest.ru/cert" }
+$tildaProjectId = Get-ConfigString $config "tilda_project_id" ""
+if ([string]::IsNullOrWhiteSpace($tildaProjectId)) { $tildaProjectId = "7369823" }
+$tildaPageId = Get-ConfigString $config "tilda_page_id" ""
+if ([string]::IsNullOrWhiteSpace($tildaPageId)) { $tildaPageId = "52476943" }
+$certificateFormId = Get-ConfigString $config "certificate_form_id" ""
+if ([string]::IsNullOrWhiteSpace($certificateFormId)) { $certificateFormId = "form777631482" }
+
+$resolvedOrigin = Get-ConfigString $config "origin" ""
+if ([string]::IsNullOrWhiteSpace($resolvedOrigin)) { $resolvedOrigin = "https://pixelquest.ru" }
+$resolvedReferer = Get-ConfigString $config "referer" ""
+if ([string]::IsNullOrWhiteSpace($resolvedReferer)) { $resolvedReferer = "$($tildaPageUrl.TrimEnd('/'))/" }
+
+if ($Interactive) {
+    $nStr = Read-Host "How many certificate codes to generate?"
+    $nParsed = 0
+    if (-not [int]::TryParse($nStr, [ref]$nParsed)) {
+        throw "Enter a positive integer for the number of codes."
+    }
+    $n = $nParsed
+    if ($n -lt 1) {
+        throw "Enter a positive integer for the number of codes."
+    }
+    $sumIn = Read-Host "mask_sum (certificate amount) [default: $(Get-ConfigString $config 'mask_sum' '')]"
+    if (-not [string]::IsNullOrWhiteSpace($sumIn)) { $config | Add-Member -NotePropertyName mask_sum -NotePropertyValue $sumIn -Force }
+    $dateIn = Read-Host "mask_date [default: $(Get-ConfigString $config 'mask_date' '')]"
+    if (-not [string]::IsNullOrWhiteSpace($dateIn)) { $config | Add-Member -NotePropertyName mask_date -NotePropertyValue $dateIn -Force }
+    $openCfg = Read-Host "Open config file in default editor? (y/N)"
+    if ($openCfg -match '^(y|yes)$') {
+        $fullCfg = (Resolve-Path -LiteralPath $ConfigPath).Path
+        Start-Process -FilePath "notepad.exe" -ArgumentList $fullCfg | Out-Null
+        Read-Host "Press Enter after you finish editing (if needed)"
+    }
+    $codes = New-RandomCertificateCodes -Count $n
+    Write-Host "Generated $n random codes."
+}
+else {
+    $codes = @(Get-Content -LiteralPath $CodesPath -Encoding UTF8 | ForEach-Object { $_.Trim() } | Where-Object {
+        $_ -and ($_ -notmatch '^\s*#')
+    })
+}
+
+if ($codes.Count -eq 0) {
+    throw "No certificate codes to process."
+}
+
+$needFetch = $FetchTokens -or (Test-IsPlaceholderGuid (Get-ConfigString $config "secure" "")) -or (Test-IsPlaceholderGuid (Get-ConfigString $config "doc_id" ""))
+$tildaPassword = $null
+if ($needFetch) {
+    $tildaPassword = [Environment]::GetEnvironmentVariable("CERT_TILDA_PASSWORD", "Process")
+    if ([string]::IsNullOrWhiteSpace($tildaPassword)) {
+        $tildaPassword = [Environment]::GetEnvironmentVariable("CERT_TILDA_PASSWORD", "User")
+    }
+    if ([string]::IsNullOrWhiteSpace($tildaPassword)) {
+        $sec = Read-Host -AsSecureString "Tilda page password (or set CERT_TILDA_PASSWORD)"
+        $tildaPassword = ConvertFrom-SecureStringPlain -SecureString $sec
+    }
+    if ([string]::IsNullOrWhiteSpace($tildaPassword)) {
+        throw "Password required to fetch secure/doc_id (placeholders in config or -FetchTokens)."
+    }
+    Write-Host "Unlocking Tilda page and parsing secure/doc_id..."
+    $uaFetch = Get-ConfigString $config "user_agent" ""
+    if ([string]::IsNullOrWhiteSpace($uaFetch)) { $uaFetch = $null }
+    $pageHtml = Invoke-TildaAccessPageUnlock -Password $tildaPassword -ProjectId $tildaProjectId -PageId $tildaPageId `
+        -RefererPageUrl $tildaPageUrl -Origin $resolvedOrigin -UserAgent $uaFetch
+    $pair = Get-SecureDocIdFromPageHtml -Html $pageHtml -CertificateFormId $certificateFormId
+    $config | Add-Member -NotePropertyName secure -NotePropertyValue $pair.Secure -Force
+    $config | Add-Member -NotePropertyName doc_id -NotePropertyValue $pair.DocId -Force
+    Write-Host "Fetched secure=$($pair.Secure) doc_id=$($pair.DocId)"
+}
 
 $headers = @{
     "Accept"            = "text/plain, */*; q=0.01"
-    "Origin"            = $config.origin
-    "Referer"           = $config.referer
+    "Origin"            = $resolvedOrigin
+    "Referer"           = $resolvedReferer
     "sec-fetch-dest"    = "empty"
     "sec-fetch-mode"    = "cors"
     "sec-fetch-site"    = "cross-site"
 }
-if ($config.user_agent) {
-    $headers["User-Agent"] = $config.user_agent
+$uaHeader = Get-ConfigString $config "user_agent" ""
+if (-not [string]::IsNullOrWhiteSpace($uaHeader)) {
+    $headers["User-Agent"] = $uaHeader
 }
 
 $session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
-
-$codes = @(Get-Content -LiteralPath $CodesPath -Encoding UTF8 | ForEach-Object { $_.Trim() } | Where-Object {
-    $_ -and ($_ -notmatch '^\s*#')
-})
-
-if ($codes.Count -eq 0) {
-    throw "No certificate codes found in $CodesPath"
-}
 
 if (-not (Test-Path -LiteralPath $outputDir)) {
     New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
 }
 
+$fsc = Get-ConfigString $config "form_spec_comments" ""
 $flat = @{
-    mask_sum             = [string]$config.mask_sum
-    mask_date            = [string]$config.mask_date
-    mask_city            = [string]$config.mask_city
-    mask_adress          = [string]$config.mask_adress
-    mask_phone           = [string]$config.mask_phone
-    mask_valuta          = [string]$config.mask_valuta
-    secure               = [string]$config.secure
-    doc_id               = [string]$config.doc_id
-    form_id              = [string]$config.form_id
-    form_spec_comments   = if ($config.form_spec_comments) { [string]$config.form_spec_comments } else { $null }
+    mask_sum             = Get-ConfigString $config "mask_sum" ""
+    mask_date            = Get-ConfigString $config "mask_date" ""
+    mask_city            = Get-ConfigString $config "mask_city" ""
+    mask_adress          = Get-ConfigString $config "mask_adress" ""
+    mask_phone           = Get-ConfigString $config "mask_phone" ""
+    mask_valuta          = Get-ConfigString $config "mask_valuta" ""
+    secure               = Get-ConfigString $config "secure" ""
+    doc_id               = Get-ConfigString $config "doc_id" ""
+    form_id              = Get-ConfigString $config "form_id" ""
+    form_spec_comments   = if ([string]::IsNullOrWhiteSpace($fsc)) { $null } else { $fsc }
 }
 
 $ok = 0
