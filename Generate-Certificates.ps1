@@ -5,7 +5,7 @@
 
   Modes:
   - Default: read config.json + codes.txt, POST tilda-create for each code.
-  - -Interactive: ask how many codes to generate, optional prompts for sum/date, generate random codes.
+  - -Interactive: ask how many codes to generate, optional prompts for sum/date, generate random codes and save them to codes.txt (one per line).
   - Tokens: if secure/doc_id are placeholders (all zeros) or -FetchTokens, unlock Tilda password page
     via auth.tildacdn.com (two-step POST /api/accesspage) and parse hidden fields from HTML.
 
@@ -476,7 +476,8 @@ if ($Interactive) {
         Read-Host "Press Enter after you finish editing (if needed)"
     }
     $codes = New-RandomCertificateCodes -Count $n
-    Write-Host "Generated $n random codes."
+    Set-Content -LiteralPath $CodesPath -Value $codes -Encoding UTF8
+    Write-Host "Generated $n random codes and saved to $CodesPath (one per line)."
 }
 else {
     $codes = @(Get-Content -LiteralPath $CodesPath -Encoding UTF8 | ForEach-Object { $_.Trim() } | Where-Object {
